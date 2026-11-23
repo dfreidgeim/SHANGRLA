@@ -283,6 +283,57 @@ class TestNonnegMean:
         with pytest.raises(AssertionError):
             test.sjm(4.5, 0.56, np.array([1, 2, 3, 4, 5]))
 
+
+    def test_trunc_mix_beta(self):
+        """Test TruncMix Beta for both WR and WoR data, checking analytical correctness."""
+        
+        u = 1.0
+        t = 0.5
+        x = np.array([1.0, 0.0, 1.0, 0.5, 1.0])
+
+        # test WR across different priors
+        N_wr = np.inf
+        for a1, a2 in [(1.0, 1.0), (0.1, 17.9)]:
+            estimator = NonnegMean(t=t, u=u, N=N_wr)
+            estimator.a1 = a1
+            estimator.a2 = a2
+            
+            bets = estimator.trunc_mix_beta(x)
+            
+            # Manually calculate the exact expected first bet based on the prior
+            scale_factor = 1 / (1 - sp.stats.beta.cdf(0.5, a1, a2))
+            B_05 = sp.special.beta(a1, a2) / scale_factor
+            C_0 = (0.5**(a1 + a2)) / B_05
+            b_0 = (0 + a1 + C_0 / 1.0) / (0 + 0 + a1 + a2)
+            
+            expected_first_bet = max(0.0, (b_0 - t) / (t * (1 - t)))
+            
+            # Assertions
+            assert len(bets) == len(x)
+            np.testing.assert_almost_equal(bets[0], expected_first_bet, decimal=6, 
+                                           err_msg=f"WR: First bet failed for prior Beta({a1}, {a2})")
+
+        # test WoR across different priors and N
+        for N_wor in [5000, 50000]:  # Tests different dynamic matrix_trunc_dim sizes
+            for a1, a2 in [(1.0, 1.0), (0.1, 17.9)]:
+                estimator = NonnegMean(t=t, u=u, N=N_wor)
+                estimator.a1 = a1
+                estimator.a2 = a2
+                
+                bets = estimator.trunc_mix_beta(x)
+                
+                # Manually calculate the exact expected first bet for WoR prior
+                # WoR uses the matrix I_Beta_array[0,0] for the prior calculation
+                I_Beta_00 = sp.special.beta(a1, a2) * (1 - sp.stats.beta.cdf(t, a1, a2))
+                b_0_wor = (a1 + 0.5**(a1 + a2) / I_Beta_00) / (a1 + a2)
+                
+                expected_first_bet_wor = max(0.0, (b_0_wor - t) / (t * (1 - t)))
+                
+                # Assertions
+                assert len(bets) == len(x)
+                np.testing.assert_almost_equal(bets[0], expected_first_bet_wor, decimal=6,
+                                               err_msg=f"WoR: First bet failed for N={N_wor}, Beta({a1}, {a2})")
+
 ##########################################################################################
 if __name__ == "__main__":
     sys.exit(pytest.main(["-qq"], plugins=None))

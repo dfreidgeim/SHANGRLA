@@ -1,9 +1,21 @@
 import math
 import numpy as np
 import scipy as sp
+import mpmath as mp
 import warnings
 
-##########################################################################################
+from .truncmix_helpers import (
+    _update_I_Beta_curr,
+    _update_zeta_array_row,
+    _update_phi_array_row,
+    _create_recursive_Beta_Binomial_array,
+    _update_Beta_Binomial_array,
+    _calculate_RIP_null,
+    _calculate_truncated_dirichlet_mean_Gauss_Legendre,
+    _precompute_log_I_Beta,
+    _update_row_array_general,
+    _get_sequential_truncation_window,
+)
 
 
 def welford_mean_var(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -17,6 +29,8 @@ def welford_mean_var(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         v.append(v[-1] + (xi - m[-2]) * (xi - m[-1]))
     v = v / np.arange(1, len(x) + 1)
     return np.array(m), v
+
+##########################################################################################
 
 
 class NonnegMean:
@@ -559,6 +573,327 @@ class NonnegMean:
         c = c_g_0 + (c_g_m - c_g_0) * (1 - 1 / (1 + c_g_g * np.sqrt(np.arange(len(x)))))
         lamj = np.maximum(0, np.minimum(c / t_adj, lamj))
         return lamj
+
+
+
+
+    def trunc_mix_beta(self, x: np.array, **kwargs) -> np.array:
+        """
+        TruncMix(Beta) estimator for With-Replacement (WR) and Without-Replacement (WoR) ternary data suitable for ballot-polling audits.
+        
+        Extracts parameters from `self`:
+        - a1, a2: Beta prior parameters
+        - matrix_trunc_dim: Truncation dimension for WoR
+        - zeta_vector, I_Beta_array, ell: Pre-initialized arrays for WoR computations
+        """
+        u = self.u
+        N = self.N
+        t = self.t
+
+        # Extract hyperparameters or set defaults
+        a1 = getattr(self, "a1", 0.1)
+        a2 = getattr(self, "a2", 17.9)
+
+        lamj = np.zeros(len(x))
+        if len(x) == 0:
+            return lamj
+
+        is_ternary = np.all(np.isin(x, [0.0, 0.5, 1.0]))
+
+        if is_ternary and not np.isfinite(N):
+
+            # With Replacement (WR) ternary data
+            scale_factor = 1 / (1 - sp.stats.beta.cdf(0.5, a1, a2))
+            Beta_a1_a2 = sp.special.beta(a1, a2)
+            B_05 = Beta_a1_a2 / scale_factor
+            C_0 = (0.5**(a1 + a2)) / B_05
+            
+            j_t, k_t = 0, 0
+            W_prev = 1.0
+
+            for j, x_val in enumerate(x):
+                eta_t = (j_t + a1 + C_0 / W_prev) / (j_t + k_t + a1 + a2)
+                lam_j = 0.0
+                
+                if eta_t > t:
+                    lam_j = (eta_t - t) / (t * (1 - t))
+                
+                lamj[j] = lam_j
+                
+                W_prev *= (1 + lam_j * (x_val - t))
+                j_t += (x_val == 1)
+                k_t += (x_val == 0)
+
+        elif is_ternary and np.isfinite(N):
+            # Without Replacement (WoR) ternary data
+            get_trunc_dim = lambda N: next((v for t, v in [(10000, 200), (50000, 250), (100000, 300), (250000, 500), (1000000, 1000)] if N <= t), 10000)
+            matrix_trunc_dim = getattr(self, "matrix_trunc_dim", get_trunc_dim(N))
+            
+            audit_cutoff = len(x)
+            if audit_cutoff == 0:
+                return lamj
+                
+            # initialise coefficient arrays and arrays of incomplete beta functions
+            zeta_vector = np.zeros(audit_cutoff)
+            zeta_vector[0] = 1.0
+            phi_vector = np.zeros(audit_cutoff)
+            phi_vector[0] = 1.0
+            
+            I_Beta_array = np.zeros((matrix_trunc_dim + 1, matrix_trunc_dim + 1))
+            I_Beta_array[0, 0] = sp.special.beta(a1, a2) * (1 - sp.stats.beta.cdf(t, a1, a2))
+            
+            ell_orig = np.arange(audit_cutoff)
+            ell = ell_orig[:, None]
+            emm = ell_orig[None, :]
+
+            log2 = np.log(2)
+            j_t, k_t, h_t = 0, 0, 0
+            h_t_J, h_t_K = 0, 0
+            mu_prod_log = 0.0
+            S_j = 0.0  # Added for running total
+
+            eta_t = (a1 + 0.5**(a1 + a2) / I_Beta_array[0, 0]) / (a1 + a2)
+
+            for j, x_val in enumerate(x):
+                N_remaining = self.N - j
+                t_adj = (self.N * t - S_j) / N_remaining if N_remaining > 0 else t
+
+                if t_adj <= 0.0 or t_adj >= 1.0:
+                 break # default lam_j to 0 for future times to avoid division by 0
+
+
+                lam_j = 0.0
+                if eta_t > t_adj:
+                    lam_j = (eta_t - t_adj) / (t_adj * (1 - t_adj))
+                
+                lamj[j] = lam_j
+                S_j += x_val
+                
+                if not ((x_val == 0.5) and (t_adj == 0.5)):
+                    I_Beta_array = _update_I_Beta_curr(
+                        I_Beta_array, j_t, k_t, h_t_J, h_t_K, x_val, a1, a2, 
+                        ell, emm, t_adj, mu_prod_log, log2, matrix_trunc_dim
+                    )
+
+                if x_val == 0.5:
+                    if t_adj < 0.5:
+                        zeta_vector = _update_zeta_array_row(zeta_vector, t_adj, h_t_J, use_scale=1)
+                        h_t_J += 1
+                    elif t_adj > 0.5:
+                        phi_vector = _update_phi_array_row(phi_vector, t_adj, h_t_K, use_scale=1)
+                        h_t_K += 1
+
+                j_t += (x_val == 1)
+                k_t += (x_val == 0)
+                h_t += (x_val == 0.5)
+
+                h_J = min(h_t_J, matrix_trunc_dim)
+                h_K = min(h_t_K, matrix_trunc_dim)
+                
+                tmp = I_Beta_array[:h_J+1, :h_K+1] @ phi_vector[:h_K+1]
+                Numerator_curr = zeta_vector[:h_J+1] @ tmp
+
+                mu_prod_log += np.log(1 / (t_adj**(x_val == 1) * (1 - t_adj)**(x_val == 0)))
+                
+                I_Beta_array_assuming_1 = I_Beta_array.copy()
+                I_Beta_array_assuming_1 = _update_I_Beta_curr(
+                    I_Beta_array_assuming_1, j_t, k_t, h_t_J, h_t_K, 1, a1, a2, 
+                    ell, emm, 1, mu_prod_log, log2, matrix_trunc_dim
+                )
+                
+                tmp_1 = I_Beta_array_assuming_1[:h_J+1, :h_K+1] @ phi_vector[:h_K+1]
+                Numerator_assuming_1 = zeta_vector[:h_J+1] @ tmp_1
+                
+                eta_t = Numerator_assuming_1 / Numerator_curr
+
+        else:
+
+            # General [0,U] TruncMix(Beta)
+
+            scaled_t = t / u # rescale to [0,1]
+            scaled_x = x / u
+
+            dps_accuracy = getattr(self, "dps_accuracy", 8) 
+            max_safe_dim = getattr(self, "max_safe_dim", 20000)
+            audit_cutoff = getattr(self, "matrix_trunc_dim", len(scaled_x))
+
+            log_I_Beta_array = _precompute_log_I_Beta(audit_cutoff, scaled_t, a1, a2, max_safe_dim) # generate matrix of log incomplete beta functions
+
+            zeta_vector = np.zeros(audit_cutoff + 1)
+            zeta_vector[0] = 1.0
+            phi_vector = np.zeros(audit_cutoff + 1)
+            phi_vector[0] = 1.0
+
+            eta_t = np.exp(log_I_Beta_array[1, 0] - log_I_Beta_array[0, 0])
+            h_t_1, h_t_2 = 0, 0
+            S_j = 0.0
+            prev_window = None
+
+            for j, x_val in enumerate(scaled_x):
+                
+                if np.isfinite(self.N):
+                    N_remaining = self.N - j
+                    t_adj = (self.N * scaled_t - S_j) / N_remaining if N_remaining > 0 else scaled_t
+                else:
+                    t_adj = scaled_t
+
+                if t_adj <= 0.0 or t_adj >= 1.0:
+                    break # default lam_j to 0 for future times to avoid division by 0
+
+                
+                lam_j = 0.0
+                if eta_t > t_adj:
+                    lam_j = (eta_t - t_adj) / (t_adj * (1 - t_adj)) # calculate the bet based on current posterior mean (eta_t)
+                
+                lamj[j] = lam_j
+                S_j += x_val
+
+                # Prevent index out-of-bounds if audit_cutoff was restricted by matrix_trunc_dim
+                if h_t_1 >= audit_cutoff or h_t_2 >= audit_cutoff:
+                    continue
+
+                # Update coefficient arrays
+                if x_val != t_adj:
+                    if t_adj < x_val:
+                        zeta_vector, _ = _update_row_array_general(zeta_vector, t_adj, x_val, h_t_1, type='zeta')
+                        h_t_1 += 1
+                    elif t_adj > x_val:
+                        phi_vector, _ = _update_row_array_general(phi_vector, t_adj, x_val, h_t_2, type='phi')
+                        h_t_2 += 1
+
+                # Get truncation window
+                with np.errstate(divide='ignore'):
+                    log_zeta = np.log(zeta_vector)
+                    log_phi = np.log(phi_vector)
+
+                L1, U1, L2, U2 = _get_sequential_truncation_window(log_zeta, log_phi, log_I_Beta_array, dps_accuracy=dps_accuracy, prev_window=prev_window)
+                prev_window = L1, U1, L2, U2
+
+                # Calculate next posterior mean (eta_{t+1})
+                log_zeta_active = log_zeta[L1 : U1 + 1]
+                log_phi_active  = log_phi[L2 : U2 + 1]
+                
+                matrix_chunk = log_I_Beta_array[L1 : U1 + 1, L2 : U2 + 1]
+                combined_grid = log_zeta_active[:, None] + log_phi_active[None, :] + matrix_chunk
+
+                shifted_chunk = log_I_Beta_array[L1 + 1 : U1 + 2, L2 : U2 + 1]
+                combined_grid_shifted = log_zeta_active[:, None] + log_phi_active[None, :] + shifted_chunk
+                
+                log_numerator_sum = sp.special.logsumexp(combined_grid_shifted)
+                eta_t = np.exp(log_numerator_sum - sp.special.logsumexp(combined_grid))
+
+        return lamj
+
+    
+    def trunc_mix_beta_binomial(self, x: np.array, **kwargs) -> np.array:
+        """
+        TruncMix Beta-Binomial estimator for binary Without-Replacement (WoR) data.
+        Requires finite N and strictly {0, 1} data. The upper bound u is ignored.
+        """
+        if np.isinf(self.N):
+            raise ValueError("trunc_mix_beta_binomial requires a finite population size N (WoR).")
+            
+        # Data must be strictly binary {0, 1}
+        if not np.all(np.isin(x, [0.0, 1.0])):
+            raise ValueError("trunc_mix_beta_binomial requires strictly binary {0, 1} data.")
+            
+        t = self.t
+        lamj = np.zeros(len(x))
+        if len(x) == 0:
+            return lamj
+            
+        a1 = getattr(self, "BB_prior_a1", 1.0)
+        a2 = getattr(self, "BB_prior_a2", 1.0)
+        
+        # Setup PMF dynamically
+        BB_pmf_array = _create_recursive_Beta_Binomial_array(self.N, (a1, a2))
+        indices = np.arange(self.N + 1)
+        C_BB = BB_pmf_array.sum()
+        
+        j_t, k_t = 0, 0
+        S_j = 0.0
+        
+        # Initial bet before data
+        eta_t = np.dot(indices / self.N, BB_pmf_array) / C_BB
+
+        for j, x_val in enumerate(x):
+            N_remaining = self.N - j
+            t_adj = (self.N * t - S_j) / N_remaining if N_remaining > 0 else t
+
+            if t_adj <= 0.0 or t_adj >= 1.0:
+                break # default lam_j to 0 for future times to avoid division by 0
+
+            # Calculate and store the bet
+            lam_j = 0.0
+            if eta_t > t_adj:
+                lam_j = (eta_t - t_adj) / (t_adj * (1 - t_adj))
+            lamj[j] = lam_j
+            
+            # Update state variables
+            S_j += x_val
+            j_t += (x_val == 1.0)
+            k_t += (x_val == 0.0)
+            
+            BB_pmf_array, C_BB = _update_Beta_Binomial_array(BB_pmf_array, self.N, indices, a1, a2, j_t, k_t, x_val)
+            
+            # Calculate next step's expected mean
+            if C_BB > 0 and (self.N - (j + 1)) > 0:
+                eta_t = np.dot((indices - j_t) / (self.N - (j + 1)), BB_pmf_array) / C_BB
+            else:
+                eta_t = t_adj
+
+        return lamj
+
+    def trunc_mix_dirichlet(self, x: np.array, **kwargs) -> np.array:
+        """
+        TruncMix Dirichlet estimator for ternary Without-Replacement (WoR) data.
+        Requires finite N and strictly {0, 0.5, 1} data. The upper bound u is ignored.
+        """
+        if np.isinf(self.N):
+            raise ValueError("trunc_mix_dirichlet requires a finite population size N (WoR).")
+
+        # Data must be strictly ternary {0, 0.5, 1}
+        if not np.all(np.isin(x, [0.0, 0.5, 1.0])):
+            raise ValueError("trunc_mix_dirichlet requires strictly ternary {0, 0.5, 1} data.")
+
+        t = self.t
+        lamj = np.zeros(len(x))
+        if len(x) == 0:
+            return lamj
+            
+        a_ones = getattr(self, "DT_prior_ones", 1.0)
+        a_halves = getattr(self, "DT_prior_halves", 1.0)
+        a_zeros = getattr(self, "DT_prior_zeros", 1.0)
+        n_nodes = getattr(self, "DT_n_nodes", 15)
+
+        j_t, k_t, u_t = 0, 0, 0
+        S_j = 0.0
+
+        for j, x_val in enumerate(x):
+            N_remaining = self.N - j
+            t_adj = (self.N * t - S_j) / N_remaining if N_remaining > 0 else t
+
+            if t_adj <= 0.0 or t_adj >= 1.0:
+                break # default lam_j to 0 for future times to avoid division by 0
+            
+            b_posterior = _calculate_truncated_dirichlet_mean_Gauss_Legendre(
+                a_ones + j_t, a_zeros + k_t, a_halves + u_t, t_adj, n_nodes=n_nodes
+            )
+            
+            mu_null = _calculate_RIP_null(b_posterior, j_t, k_t, N_remaining)
+            
+            lam_j = 0.0
+            if not np.any(mu_null <= 0):
+                lam_j = max(0.0, (b_posterior[0] / mu_null[0]) - (b_posterior[1] / mu_null[1]))
+            lamj[j] = lam_j
+            
+            S_j += x_val
+            j_t += (x_val == 1.0)
+            k_t += (x_val == 0.0)
+            u_t += (x_val == 0.5)
+
+        return lamj
+
 
     def lam_to_eta(self, lam: np.array, mu: np.array) -> np.array:
         """
